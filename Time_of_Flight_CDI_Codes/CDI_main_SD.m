@@ -1,0 +1,210 @@
+%% Diffusive tomography imaging
+%  ------------------------------------------------------------------------
+%  Minimisation of 
+%  0.5 * || A X - Y || + R(X)
+%  where:
+%     - A: measurement operator
+%     - R(X): regularisation to introduce prior information on X
+
+clear all;
+clc;
+close all;
+addpath('data')
+addpath('tools')
+
+Ver = version;
+Ye = Ver([end-5:end-2]);
+if sum(Ye=='2018')<4
+    OldMatlab = 1;
+end
+%% Load data and parameters
+
+
+save_result = 0; % save the final image of the reconstruction.
+acceleration = 1; % increase step size at i = 200 and i = 1000.
+
+% choice_sim = 'triangle' ;
+choice_sim = 'A' ;
+% choice_sim = 'X' ;
+% choice_sim = 'res' ;
+% choice_sim = 'res_small_5mm' ;
+% choice_sim = 'res_small_2mm' ;
+% choice_sim = 'res_small_1mm' ;
+
+load_data
+
+C0 = Cdf; % save raw observation
+
+nx = size(Cdf,1) ;
+ny = size(Cdf,2) ;
+
+% Temporal Frame selection -- select only temporal zone of interest
+st = 21 ;  % index first temporal frame
+nd = 120 ; % index last temporal frame
+
+% Laser phase correction to take into account the temporal indexing
+a0 = a0-st+1; 
+
+
+
+
+%% Data Pre-processing
+
+% -- Data Thresholding ----------------------------------------------------
+% -- threshold low intensities to: 1 - prevent sharp edges in the ---------
+% -- convolutions and 2 - ignore noisy pixels -----------------------------
+% -------------------------------------------------------------------------
+
+Cds = sum(Cdf,3);
+Cds(Cds<mc*max(Cds(:))) = 0; % A, triangle, X
+Cds(Cds>0) = 1;
+
+CDS = zeros(size(Cdf));
+for zi = 1:size(Cdf,3)
+    CDS(:,:,zi) = Cds;
+end
+Cdf = Cdf.*CDS;
+
+% -- Temporal Frame selection ---------------------------------------------
+% -------------------------------------------------------------------------
+C2 = Cdf(:,:,st:nd);
+CDS2 = CDS(:,:,st:nd);
+
+% -- Normalisation of Camera Video ----------------------------------------
+% -------------------------------------------------------------------------
+nc2 = sum(C2(:));
+C2 = C2./nc2;
+
+% -- Zero-padding in space + bluring of the edges to avoid sharp edges in
+% the convolutions --------------------------------------------------------
+% -------------------------------------------------------------------------
+
+bf = 24 ; % nb of pixels for zero-padding
+dc = 1 ; % std dev for Gaussian kernel for bluring
+
+C2 = extend_video_xy(C2,bf,dc);
+CDS2 = extend_video_xy(CDS2,bf,dc);
+
+% Additional parameters ---------------------------------------------------
+% -------------------------------------------------------------------------
+lt = size(C2,3); % nb of temporal samplings
+dt = 50*10^-12;  % temporal resolution
+yoc = 0.025;     % object-FOV distance. 
+
+
+
+%% Compute the illumination at the entering surface
+
+% Resolution in both directions
+dPy = (max(Pp(:,3))-min(Pp(:,3)))/size(C2,1);
+dPx = (max(Pp(:,2))-min(Pp(:,2)))/size(C2,1);
+
+% Re-adjust laser center to take into account the XY extension
+pl(3) = pl(3)+bf*dPy; 
+pl(2) = pl(2)+bf*dPx;
+
+% Make a 2D Gaussian kernel
+G = make_2D_gaussian(size(C2,1),size(C2,2),dPx,dPy,[pl(3),pl(2)],sigmal);
+
+
+% Build spatio-temporal light field at the entering surface
+% (a Delta function in time and gaussian in space)
+I0 = zeros(size(G,1),size(G,2),size(C2,3)); % Empty data cube 
+I0(:,:,1) = G; % delta function in time at index=1 and gaussian in space.
+I0 = I0./sum(I0(:)); % normalise
+
+
+%% Compute the first PSF
+
+Ail = make_true_PSF(Pp,lt,dt,lm,la,0,yoc); % Make a 2D+t PSF (data size)
+pzil = round(size(Ail,3)/2); 
+Ailp = pad_3D(Ail,bf,bf,pzil); % zero-padding (extended data size)
+Ailp = fix_periodicity(Ailp); % shifting -- TO BE UPDATED (fftshift?)
+
+% Fourier transform of the first PSF
+Afil = fftn(Ailp);
+
+%% Compute field at the depth of the object.
+I = run_fmodl(I0,Afil); % Forward model, just convolves using ffts.
+I = I./sum(I(:));
+
+%% Compute the second PSF
+%  (same as the first PSF in our case -- but depends on the object FOD
+%  distance, i.e. yoc)
+
+A = make_true_PSF(Pp,lt,dt,lm,la,0,yoc);
+pz = round(size(A,3)/2);
+
+% Fourier transform of the second PSF
+Ap = cat(3,zeros(size(A,1),size(A,2),2*pz),A);
+Ap = pad_3D(Ap,bf,bf,0);
+Ap = fix_periodicity(Ap);
+Af = fftn(Ap);
+Afn = sum(Ap(:));
+Af = Af./Afn;
+
+%% Initialisation
+%  Use the data to build a first guess of the reconstruction (a thresholded
+%  version of the camera video).
+
+C0 = C0(:,:,st:nd);
+C0 = C0./norm(C0(:));
+X0 = sum(C0(:,:,25:45),3);
+X0(X0>0.8*max(X0(:))) = 0.8*max(X0(:));
+X0 = X0./sum(X0(:));
+
+% First Guess in 3D (first guess image augmented in the third dimension)
+X0l = zeros(size(C2));
+X0a = pad_3D(X0,bf,bf,0);
+for zi = 1:size(C2,3)
+    X0l(:,:,zi) = X0a;
+end
+X0l = X0l.*I;
+cX0 = 1/sum(X0l(:));
+X0l = cX0*X0l;
+
+%% Visualise Initial Conditions
+
+AX = run_fmodl(X0l,Af,a0);
+AXN = AX;
+AXN(C2<=0)=0;
+AX1 = AX; C21 = C2;
+CS = sum(C21,3);
+AXS = sum(AX1,3);
+
+CMP = zeros(size(CS,1),size(CS,2),3);
+CMP(:,:,1) = AXS;
+CMP(:,:,2) = CS;
+
+perarray = [1,3,2];
+np = round(size(AX1,2)/2);
+C2p = permute(C21,perarray);
+Ap = permute(AX1,perarray);
+dtn = 1;
+C2pi = C2p(np-dtn:np+dtn,:,np-dtn:np+dtn); C2pi = sum(C2pi,3); C2pi = sum(C2pi,1);
+Api = Ap(np-dtn:np+dtn,:,np-dtn:np+dtn); Api = sum(Api,3); Api = sum(Api,1);
+
+% Display alignment stuff
+figure(2)
+subplot(1,4,1)
+plot(1:length(Ap(np,:,np)),C2pi,'b',1:length(Ap(np,:,np)),Api,'r')
+title('Temporal Profiles')
+subplot(1,4,2)
+plot(1:size(C21,2),CS(round(size(C21,1)/2),:),'b',1:size(AX1,2),AXS(round(size(AX1,1)/2),:),'r')
+title('X Profiles')
+subplot(1,4,3)
+plot(1:size(C21,1),CS(:,round(size(C21,2)/2)),'b',1:size(AX1,1),AXS(:,round(size(AX1,1)/2)),'r')
+title('Y Profiles')
+subplot(1,4,4)
+imshow(mat2gray(CMP))
+title('Alignment Image')
+
+%% Reconstruction algorithm -- Gradient descent -- TV + l1
+
+parameters = {bf,lambda1,lambda2};
+Xd = Reconstruction_method(Af, I , X0, cX0, niter, acceleration, s, OldMatlab, C2, CDS2, a0, parameters, display_iterations) ; 
+
+
+if save_result == 1
+    save('reconstructed_slit_28x28_2mm_5','Xd')
+end
